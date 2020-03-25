@@ -208,14 +208,12 @@ SWITCH_DECLARE(switch_status_t) kazoo_api_execute(const char *cmd, const char *a
 	char *arg_used;
 	char *cmd_used;
 	int  fire_event = 0;
-	char *arg_expanded;
+	char *arg_expanded = NULL;
 	switch_event_t* evt;
 
 	switch_assert(stream != NULL);
 	switch_assert(stream->data != NULL);
 	switch_assert(stream->write_function != NULL);
-
-	arg_expanded = (char *) arg;
 
 	switch_event_create(&evt, SWITCH_EVENT_GENERAL);
 	arg_expanded = switch_event_expand_headers(evt, arg);
@@ -507,7 +505,7 @@ static switch_status_t build_event(switch_event_t *event, ei_x_buff * buf) {
 			if(!strcasecmp(key, "Call-ID")) {
 				switch_core_session_t *session = NULL;
 				if(!zstr(value)) {
-					if ((session = switch_core_session_force_locate(value)) != NULL) {
+					if ((session = switch_core_session_locate(value)) != NULL) {
 						switch_channel_t *channel = switch_core_session_get_channel(session);
 						switch_channel_event_set_data(channel, event);
 						switch_core_session_rwunlock(session);
@@ -1452,7 +1450,7 @@ static void *SWITCH_THREAD_FUNC receive_handler(switch_thread_t *thread, void *o
 	while (switch_test_flag(ei_node, LFLAG_RUNNING) && switch_test_flag(&kazoo_globals, LFLAG_RUNNING)) {
 		void *pop = NULL;
 
-		if (switch_queue_pop_timeout(ei_node->received_msgs, &pop, 100000) == SWITCH_STATUS_SUCCESS) {
+		if (ei_queue_pop(ei_node->received_msgs, &pop, ei_node->receiver_queue_timeout) == SWITCH_STATUS_SUCCESS) {
 			ei_received_msg_t *received_msg = (ei_received_msg_t *) pop;
 			handle_erl_msg(ei_node, &received_msg->msg, &received_msg->buf);
 			ei_x_free(&received_msg->buf);
@@ -1505,7 +1503,7 @@ static void *SWITCH_THREAD_FUNC handle_node(switch_thread_t *thread, void *obj) 
 		}
 
 		while (++send_msg_count <= kazoo_globals.send_msg_batch
-			   && switch_queue_pop_timeout(ei_node->send_msgs, &pop, 20000) == SWITCH_STATUS_SUCCESS) {
+			   && ei_queue_pop(ei_node->send_msgs, &pop, ei_node->sender_queue_timeout) == SWITCH_STATUS_SUCCESS) {
 			ei_send_msg_t *send_msg = (ei_send_msg_t *) pop;
 			ei_helper_send(ei_node, &send_msg->pid, &send_msg->buf);
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Sent erlang message to %s <%d.%d.%d>\n"
@@ -1518,11 +1516,12 @@ static void *SWITCH_THREAD_FUNC handle_node(switch_thread_t *thread, void *obj) 
 		}
 
 		/* wait for a erlang message, or timeout to check if the module is still running */
-		status = ei_xreceive_msg_tmo(ei_node->nodefd, &received_msg->msg, &received_msg->buf, kazoo_globals.receive_timeout);
+		status = ei_xreceive_msg_tmo(ei_node->nodefd, &received_msg->msg, &received_msg->buf, kazoo_globals.ei_receive_timeout);
 
 		switch (status) {
 		case ERL_TICK:
 			/* erlang nodes send ticks to eachother to validate they are still reachable, we dont have to do anything here */
+			fault_count = 0;
 			break;
 		case ERL_MSG:
 			fault_count = 0;
@@ -1545,6 +1544,7 @@ static void *SWITCH_THREAD_FUNC handle_node(switch_thread_t *thread, void *obj) 
 			case EAGAIN:
 				/* if ei_xreceive_msg_tmo just timed out, ignore it and let the while loop check if we are still running */
 				/* the erlang lib just wants us to try to receive again, so we will! */
+				fault_count = 0;
 				break;
 			case EMSGSIZE:
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Erlang communication fault with node %p %s (%s:%d): my spoon is too big\n", (void *)ei_node, ei_node->peer_nodename, ei_node->remote_ip, ei_node->remote_port);
@@ -1555,6 +1555,8 @@ static void *SWITCH_THREAD_FUNC handle_node(switch_thread_t *thread, void *obj) 
 
 				if (fault_count >= kazoo_globals.io_fault_tolerance) {
 					switch_clear_flag(ei_node, LFLAG_RUNNING);
+				} else {
+					switch_sleep(kazoo_globals.io_fault_tolerance_sleep);
 				}
 
 				break;
@@ -1629,6 +1631,10 @@ switch_status_t new_kazoo_node(int nodefd, ErlConnect *conn) {
 	ei_node->created_time = switch_micro_time_now();
 	ei_node->legacy = kazoo_globals.legacy_events;
 	ei_node->event_stream_framing = kazoo_globals.event_stream_framing;
+	ei_node->event_stream_keepalive = kazoo_globals.event_stream_keepalive;
+	ei_node->event_stream_queue_timeout = kazoo_globals.event_stream_queue_timeout;
+	ei_node->receiver_queue_timeout = kazoo_globals.node_receiver_queue_timeout;
+	ei_node->sender_queue_timeout = kazoo_globals.node_sender_queue_timeout;
 
 	/* store the IP and node name we are talking with */
 	switch_os_sock_put(&ei_node->socket, (switch_os_socket_t *)&nodefd, pool);
